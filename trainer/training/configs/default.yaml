@@ -1,0 +1,76 @@
+# Training configuration for multi-label image classification
+# with teacher-student distillation and QAT
+
+seed: 1337
+num_classes: 7
+
+# Teacher model configuration (EfficientNet-B3)
+teacher:
+  input_size: 300
+  batch_size: 16
+  epochs_head: 10
+  epochs_finetune: 30
+  lr_head: 1.0e-3
+  lr_finetune: 1.0e-4
+  dropout: 0.4
+  weight_decay: 1.0e-4
+  early_stopping_patience: 10
+  reduce_lr_patience: 5
+  reduce_lr_factor: 0.5
+
+# Student model configuration (EfficientNet-Lite B1)
+student:
+  input_size: 240
+  batch_size: 32
+  epochs_head: 10
+  epochs_finetune: 40
+  lr_head: 1.0e-3
+  lr_finetune: 1.0e-4
+  dropout: 0.3
+  weight_decay: 1.0e-4
+  early_stopping_patience: 10
+  reduce_lr_patience: 5
+  reduce_lr_factor: 0.5
+
+# Distillation configuration
+distillation:
+  alpha: 0.7  # Weight for hard loss (1-alpha for soft loss)
+  temperature: 2.0
+
+# QAT (Quantization Aware Training) configuration
+qat:
+  epochs: 10
+  lr: 1.0e-5
+  early_stopping_patience: 5
+
+# Data augmentation configuration (only applied to training set)
+augmentation:
+  random_flip_horizontal: true
+  random_rotation_factor: 0.03  # ~±11 degrees
+  random_zoom_factor: 0.10
+  color_jitter:
+    brightness: 0.15
+    contrast: 0.15
+    saturation: 0.15
+  gaussian_noise_stddev: 0.02
+  cutout:
+    num_patches: 2
+    patch_size_ratio: 0.10  # 10% of image area
+  mixup:
+    enabled: false  # Set to true if overfitting occurs
+    alpha: 0.2
+
+# Threshold optimization configuration
+threshold_search:
+  grid_min: 0.05
+  grid_max: 0.95
+  grid_step: 0.01
+  objective: f1_macro  # Options: f1_macro, f1_micro
+  per_class_enabled: true
+  per_class_improvement_threshold: 0.005  # 0.5% relative improvement required
+
+# TFLite export configuration
+tflite_export:
+  input_type: uint8  # Input expects uint8 values [0, 255]
+  output_type: int8  # Output will be quantized int8
+  representative_dataset_size: 200  # Number of samples for calibration

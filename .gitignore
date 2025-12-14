@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# TensorFlow
+*.h5
+*.pb
+*.ckpt*
+checkpoint
+
+# Datasets (no subir datos)
+dataset/
+datasets/
+data/
+*.jpg
+*.jpeg
+*.png
+*.gif
+
+# Outputs
+outputs/
+logs/
+tensorboard/
+*.tflite
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Mobile (Android)
+mobile/.gradle/
+mobile/.idea/
+mobile/local.properties
+mobile/build/
+mobile/app/build/
+mobile/*.iml
+mobile/.externalNativeBuild/
+mobile/.cxx/
+mobile/captures/
+
+# Temporary files
+*.tmp
+*.log

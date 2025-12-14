@@ -1,0 +1,665 @@
+## **Etapa 1 — Sistema de entrenamiento (Docker) para multi‑label \+ teacher→student \+ QAT INT8**
+
+### **0\) Objetivo (contrato de salida)**
+
+El contenedor debe consumir `dataset/` y producir en un directorio de salida:
+
+**Obligatorios**
+
+* `model_qat_int8.tflite` (modelo alumno final, cuantizado INT8, listo para móvil)
+
+* `labels.txt` (una clase por línea, **en el orden exacto** del vector de salida)
+
+* `metrics.json` con:
+
+  * `precision_macro`, `recall_macro`, `f1_macro`, `f1_micro`
+
+  * (recomendado extra) `precision_micro`, `recall_micro`, `per_class` (P/R/F1/support), `no_label_rate`
+
+* `threshold_recommendation.json` con:
+
+  * `global_threshold`
+
+  * `per_class_thresholds` (opcional)
+
+  * `calibration_notes`
+
+**Recomendado (muy útil para integrar sin ambigüedades)**
+
+* `inference_config.json` (unifica todo: labels \+ thresholds \+ preprocesamiento \+ detalles de cuantización/activación)
+
+* `artifacts/` (curvas PR por clase, matriz de correlación de etiquetas, ejemplos de errores)
+
+Nota: El motor C tiene `image_rec_init(model_path, config_path)`; por eso `inference_config.json` es la pieza “puente” ideal: el móvil solo copia **dos archivos** (modelo \+ config).
+
+## **1\) Reglas de compatibilidad con inferencia móvil (fijas)**
+
+Estas reglas se implementan **tal cual** en entrenamiento para que el modelo generalice al pipeline móvil.
+
+### **1.1 Preprocesamiento geométrico (LETTERBOX)**
+
+**Entrada:** imagen decodificada en RGB (sin alpha), dtype uint8 \[0..255\].  
+ **Salida geométrica:** tensor 240×240×3 (RGB), manteniendo aspecto:
+
+1. Calcular escala `s = 240 / max(h, w)`
+
+2. Redimensionar a `(round(h*s), round(w*s))` con **bilinear**
+
+3. Pegar centrado en un canvas negro 240×240 (padding negro)
+
+4. **No recortar** (en inferencia no hay crop), solo letterbox.
+
+Este letterbox es el que describiste para C. Debe ser idéntico en train/val/test (sin aleatoriedad).
+
+### **1.2 Normalización (para EfficientNet‑Lite)**
+
+Para el alumno EfficientNet‑Lite B1, el repositorio de Keras reimplementado indica que el preprocesamiento esperado (para pesos tipo ImageNet) es:  
+ `(x - 127.00) / 128.00` (asumiendo x en 0..255) 
+
+**Regla**: entrenamiento del alumno usa float32 con ese mapeo a \~\[-1, 1\].
+
+En el modelo TFLite INT8 final, lo ideal es que el **input sea uint8** y la cuantización (scale/zero\_point) represente ese mapeo. Así el motor C puede alimentar bytes 0..255 sin normalizar manualmente (solo letterbox).
+
+### **1.3 Teacher EfficientNet‑B3 (preprocesamiento)**
+
+Keras indica que EfficientNet (B\*) incluye preprocesamiento como parte del modelo y espera tensores float con valores de pixel en **\[0..255\]** [TensorFlow](https://www.tensorflow.org/api_docs/python/tf/keras/applications/EfficientNetB3?utm_source=chatgpt.com).  
+ **Regla:** al teacher se le alimenta la imagen letterbox a su tamaño (300) en \[0..255\] float32.
+
+---
+
+## **2\) Estructura del repositorio** 
+
+`training/`  
+`├── Dockerfile`  
+`├── requirements.txt`  
+`├── README.md`  
+`├── configs/`  
+`│   └── default.yaml`  
+`├── src/`  
+`│   ├── cli.py`  
+`│   ├── data/`  
+`│   │   ├── dataset.py`  
+`│   │   ├── parsing.py`  
+`│   │   ├── augment.py`  
+`│   │   └── preprocessing.py`  
+`│   ├── models/`  
+`│   │   ├── teacher.py`  
+`│   │   ├── student.py`  
+`│   │   └── losses.py`  
+`│   ├── train/`  
+`│   │   ├── train_teacher.py`  
+`│   │   ├── train_student_distill.py`  
+`│   │   ├── train_student_qat.py`  
+`│   │   └── callbacks.py`  
+`│   ├── eval/`  
+`│   │   ├── metrics.py`  
+`│   │   ├── thresholds.py`  
+`│   │   └── reports.py`  
+`│   └── export/`  
+`│       ├── tflite_export.py`  
+`│       └── metadata.py`  
+`└── tests/`  
+    `├── test_parsing.py`  
+    `├── test_letterbox.py`  
+    `├── test_thresholds.py`  
+    `└── smoke_tflite.py`
+
+---
+
+## **3\) Docker: base, dependencias y ejecución**
+
+### **3.1 Dockerfile (reglas)**
+
+* Base recomendada: `tensorflow/tensorflow:2.16.1` (CPU) o `...:2.16.1-gpu` si habrá GPU.
+
+* Instalar:
+
+  * `tensorflow-model-optimization` (QAT) [TensorFlow](https://www.tensorflow.org/model_optimization/guide/quantization/training_example?utm_source=chatgpt.com)
+
+  * `scikit-learn` (métricas \+ selección de umbrales)
+
+  * `opencv-python-headless` (si haces letterbox ahí; o hacerlo con TF puro)
+
+  * `pyyaml`, `numpy`
+
+  * **EfficientNet‑Lite Keras** desde GitHub:
+
+    * `pip install git+https://github.com/sebastian-sz/efficientnet-lite-keras@main` [GitHub](https://github.com/sebastian-sz/efficientnet-lite-keras)
+
+### **3.2 CLI del contenedor (obligatorio)**
+
+El agente implementa un comando único:
+
+`python -m src.cli train \`  
+  `--data_dir /data/dataset \`  
+  `--out_dir /out/run_001 \`  
+  `--config /app/configs/default.yaml`
+
+Y debe generar TODOS los artefactos de salida en `--out_dir`.
+
+---
+
+## **4\) Dataset: parsing, validación y prevención de “data leakage”**
+
+### **4.1 Formato de entrada (tal cual)**
+
+`dataset/`  
+`├── images/`  
+`├── train.txt`  
+`├── val.txt`  
+`└── test.txt`
+
+Cada línea:  
+ `nombre.jpg,clase1|clase3|claseN`
+
+* Si una imagen tiene **0 etiquetas**, el formato permitido debe ser:
+
+  * `nombre.jpg,` (coma al final) **o**
+
+  * `nombre.jpg` (sin coma)  
+     El parser debe soportar ambos.
+
+### **4.2 Construcción de vocabulario de clases (labels.txt)**
+
+**Regla crítica de compatibilidad:** el orden del vector de salida es el orden en `labels.txt`.
+
+Implementación:
+
+1. Leer **train/val/test**.
+
+2. Unir todas las clases vistas.
+
+3. Validar que el total sea `N=7` (si no, error explícito).
+
+4. Ordenar de forma determinista:
+
+   * recomendado: **orden alfabético** estable
+
+5. Escribir `labels.txt` (una por línea).
+
+### **4.3 Validaciones duras (fallar rápido)**
+
+El agente implementa `src/data/validation.py` (o integrado en parsing) que:
+
+* Verifica que cada imagen referenciada exista.
+
+* Detecta duplicados entre splits:
+
+  * Si el mismo filename aparece en train y val → **ERROR**.
+
+* Reporta distribución por clase y co-ocurrencias.
+
+* Reporta porcentaje de “sin etiquetas” por split.
+
+Esto es clave para evitar mezclar val/train por accidente.
+
+## **5\) Preprocesamiento y augmentations (SOTA sin romper compatibilidad)**
+
+### **5.1 Pipeline base (sin aleatoriedad)**
+
+Para **val/test** (y como base antes de augment):
+
+* decode JPEG/PNG → RGB uint8
+
+* aplicar **letterbox 240×240** (para alumno) o **letterbox 300×300** (para teacher)
+
+* convertir a float32
+
+* normalización:
+
+  * alumno: `(x - 127.0) / 128.0` [GitHub](https://github.com/sebastian-sz/efficientnet-lite-keras)
+
+  * teacher: mantener \[0..255\] y dejar preprocesamiento interno de EfficientNetB3 [TensorFlow](https://www.tensorflow.org/api_docs/python/tf/keras/applications/EfficientNetB3?utm_source=chatgpt.com)
+
+### **5.2 Augmentation (solo train, y sin leakage)**
+
+**Regla:** augmentation se aplica **solo** a batches de `train`.  
+ `val/test` nunca deben tener random ops.
+
+Augmentations recomendadas (compatibles con letterbox, sin crop agresivo):
+
+* `RandomFlip(horizontal=True)` (si el dominio lo permite)
+
+* `RandomRotation(factor=0.03)` (\~±11°)
+
+* `RandomZoom(height_factor=0.10, width_factor=0.10)`
+
+* `ColorJitter`: brillo/contraste/saturación ligeros (±10–15%)
+
+* `GaussianNoise(stddev=0.01–0.03)` sobre imagen ya normalizada
+
+* **Cutout / RandomErasing** moderado:
+
+  * 1–2 parches, tamaño 5–15% del área
+
+* (Opcional “SOTA-lite”) `MixUp` con α=0.1–0.2 (multi‑label lo soporta bien con BCE)
+
+**No recomendado** aquí:
+
+* RandomResizedCrop agresivo (desalineará con inferencia letterbox)
+
+* AugMix muy fuerte si el dataset es pequeño y el dominio es sensible
+
+### **5.3 Control de reproducibilidad**
+
+* Semilla global fija (configurable) en `random`, `numpy`, `tf`.
+
+* Guardar en `metrics.json` la semilla y el commit hash (si existe).
+
+**6\) Modelado: teacher (EfficientNet‑B3) → student (EfficientNet‑Lite B1)**
+
+### **6.1 Teacher: EfficientNet‑B3 (solo entrenamiento)**
+
+* Backbone: `tf.keras.applications.EfficientNetB3(include_top=False, weights="imagenet")`
+
+* Input: **300×300×3** (tamaño típico de B3) [TensorFlow+1](https://www.tensorflow.org/api_docs/python/tf/keras/applications/EfficientNetB3?utm_source=chatgpt.com)
+
+* Head:
+
+  * GAP
+
+  * Dropout 0.3–0.5
+
+  * Dense `N=7` (logits, **sin sigmoid** para estabilidad)
+
+* Pérdida teacher:
+
+  * `BinaryCrossentropy(from_logits=True)`
+
+  * (Opcional si hay imbalance fuerte) Focal BCE o `pos_weight` por clase
+
+**Entrenamiento teacher (2 fases anti‑overfitting):**
+
+1. **Warmup head**: congelar backbone, entrenar head 5–10 epochs.
+
+2. **Fine-tune parcial**: descongelar último 20–30% de capas, LR bajo.
+
+Regularización:
+
+* `AdamW` con weight\_decay 1e-4
+
+* EarlyStopping por `val_f1_macro` con paciencia 8–12
+
+* `ReduceLROnPlateau` o CosineDecay
+
+* (Opcional recomendado) EMA de pesos (si se implementa fácil)
+
+### **6.2 Student: EfficientNet‑Lite B1 (modelo deploy)**
+
+Usar paquete Keras EfficientNet‑Lite:
+
+* `from efficientnet_lite import EfficientNetLiteB1` [GitHub](https://github.com/sebastian-sz/efficientnet-lite-keras)
+
+* Input: **240×240×3** [GitHub](https://github.com/sebastian-sz/efficientnet-lite-keras)
+
+* Preprocesamiento esperado para pesos: `(-1..1)` con `(x-127)/128` [GitHub](https://github.com/sebastian-sz/efficientnet-lite-keras)
+
+* Head:
+
+  * GAP
+
+  * Dropout 0.2–0.4
+
+  * Dense N=7 logits (sin sigmoid)
+
+## **7\) Destilación teacher→student (multi‑label bien hecho)**
+
+### **7.1 Qué se destila**
+
+Para cada batch:
+
+* `z_t = teacher_logits(img_teacher_300)`
+
+* `z_s = student_logits(img_student_240)`
+
+Se usan **logits** para estabilidad.
+
+### **7.2 Pérdida combinada (recomendación)**
+
+Definir temperatura `T=2.0` y mezcla `alpha=0.7`:
+
+1. **Hard loss (ground truth)**  
+    `L_hard = BCEWithLogits(y_true, z_s)`
+
+2. **Soft loss (teacher)** para multi-label:  
+    Convertir a “soft targets” por clase:
+
+* `p_t = sigmoid(z_t / T)`
+
+* `p_s = sigmoid(z_s / T)`  
+   Luego:  
+   `L_soft = BCE(p_t, p_s)` (BCE estándar sobre probabilidades suaves)
+
+3. Total:  
+    `L = alpha * L_hard + (1 - alpha) * (T*T) * L_soft`
+
+Ese escalado `T*T` es práctica común en destilación; en multi‑label también ayuda a que el gradiente no colapse.
+
+### **7.3 Estrategia de entrenamiento student (3 fases)**
+
+**Fase A — Head warmup (sin QAT):**
+
+* Congelar backbone, entrenar head 5–10 epochs.
+
+**Fase B — Fine‑tuning distil (sin QAT):**
+
+* Descongelar último 30–40% del backbone Lite.
+
+* LR bajo (ej. 1e-4 → 3e-5)
+
+* EarlyStopping por `val_f1_macro`.
+
+**Fase C — QAT fine‑tune (con distil activada):**
+
+* Aplicar QAT a **todo el student** y continuar entrenando unas pocas epochs (5–15) con LR muy bajo (1e-5).
+
+* Mantener `L_soft` activo en QAT para retener “shape” del teacher.
+
+## **8\) QAT (Quantization Aware Training) — implementación obligatoria**
+
+Usar TensorFlow Model Optimization Toolkit (TFMOT). El flujo debe seguir el patrón oficial:
+
+1. Tener un modelo Keras entrenado (student).
+
+2. Crear `qat_model = tfmot.quantization.keras.quantize_model(student_model)`
+
+3. Compilar y fine‑tunear
+
+4. Exportar a TFLite cuantizado [TensorFlow](https://www.tensorflow.org/model_optimization/guide/quantization/training_example?utm_source=chatgpt.com)
+
+**Detalles prácticos para evitar caída de accuracy:**
+
+* No cambies arquitectura entre pre‑QAT y QAT.
+
+* LR muy bajo en QAT.
+
+* Recalcular BN (BatchNorm) si aplica (normalmente el fine‑tune lo ajusta).
+
+* EarlyStopping también en QAT (paciencia corta 3–5).
+
+**9\) Exportación a `model_qat_int8.tflite` (full‑integer, móvil)**
+
+### **9.1 Guardar SavedModel**
+
+Guardar el QAT model como SavedModel o directamente convertir desde Keras.
+
+### **9.2 Conversión TFLite (reglas)**
+
+* `tf.lite.TFLiteConverter.from_keras_model(qat_model)`
+
+* `optimizations = [tf.lite.Optimize.DEFAULT]`
+
+* `representative_dataset`:
+
+  * Debe usar **imágenes train** (o subset), preprocess EXACTO del student (letterbox 240 \+ normalización a \[-1,1\]).
+
+  * 100–300 muestras suelen bastar con dataset pequeño.
+
+* Forzar tipos para full integer:
+
+  * `converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]`
+
+  * `converter.inference_input_type = tf.uint8` (recomendado para bytes)
+
+  * `converter.inference_output_type = tf.int8` o `tf.uint8` (elige uno y documenta)
+
+Si la salida queda cuantizada, el motor C debe de‑cuantizar a float para comparar umbrales. Por eso en `inference_config.json` incluirás el tipo de salida y/o el motor leerá quant params del tensor.
+
+---
+
+## **10\) Selección de umbrales (global \+ opcional por clase)**
+
+### **10.1 Principio**
+
+* El modelo produce 7 probabilidades (sigmoid de logits).
+
+* Se predice etiqueta i si `p_i >= threshold_i` (o global si no hay por clase).
+
+* Se permite resultado vacío: “sin etiquetas detectadas con suficiente confianza”.
+
+### **10.2 Algoritmo (determinista y reproducible)**
+
+**Paso 1 — Obtener probabilidades en VAL**
+
+* Ejecutar student (float o tflite) sobre val para obtener `P_val` shape `[num_samples, 7]`.
+
+* `Y_val` multi‑hot `[num_samples, 7]`.
+
+**Paso 2 — Buscar umbral global**
+
+* Grid search `t ∈ {0.05..0.95}` step 0.01
+
+* Para cada t:
+
+  1. `Y_hat = (P_val >= t)`
+
+  2. calcular `f1_macro`, `f1_micro`
+
+* Elegir `t*` que maximiza **f1\_macro**.
+
+* Tie-breakers (en orden):
+
+  1. mayor recall\_macro
+
+  2. mayor f1\_micro
+
+**Paso 3 — (Opcional) umbrales por clase**
+
+* Para cada clase k:
+
+  * buscar `t_k` en la misma grilla maximizando F1 de esa clase.
+
+* Aplicar “suavizado” para evitar overfit:
+
+  * Si `|t_k - t*| > 0.25`, clamp hacia `t* ± 0.25`
+
+* **Solo activar per-class thresholds** si mejora `f1_macro` en val al menos \+0.5% relativo.
+
+**Salida**  
+ Crear `threshold_recommendation.json`:
+
+`{`  
+  `"global_threshold": 0.52,`  
+  `"per_class_thresholds": {`  
+    `"claseA": 0.60,`  
+    `"claseB": 0.45`  
+  `},`  
+  `"optimization_target": "f1_macro",`  
+  `"grid": { "min": 0.05, "max": 0.95, "step": 0.01 },`  
+  `"calibration_notes": "Optimizado en VAL; per-class habilitado solo si mejora f1_macro >= 0.5%."`  
+`}`
+
+## **11\) Métricas: definición exacta (para que no haya ambigüedad)**
+
+Implementar métricas con `sklearn` (multi-label):
+
+* `f1_macro`: promedio simple del F1 por clase
+
+* `f1_micro`: F1 global agregando TP/FP/FN de todas las clases
+
+* precision/recall análogo
+
+**Además (muy recomendado):**
+
+* `per_class`: precision/recall/f1/support por clase
+
+* `no_label_rate`: porcentaje de imágenes donde el modelo no predijo nada a umbral global (útil para UX)
+
+---
+
+## **12\) `inference_config.json` (contrato final para motor C)**
+
+Este archivo debe permitir que la inferencia móvil sea 100% reproducible. Ejemplo:
+
+`{`  
+  `"model": {`  
+    `"filename": "model_qat_int8.tflite",`  
+    `"num_classes": 7,`  
+    `"output_activation": "sigmoid",`  
+    `"output_is_logits": true`  
+  `},`  
+  `"labels": {`  
+    `"filename": "labels.txt",`  
+    `"order": "file_order"`  
+  `},`  
+  `"preprocess": {`  
+    `"color_space": "RGB",`  
+    `"input_size": 240,`  
+    `"resize": { "mode": "keep_aspect_letterbox", "interpolation": "bilinear", "pad_value_rgb": [0,0,0] }`  
+  `},`  
+  `"normalize": {`  
+    `"scheme": "efficientnet_lite",`  
+    `"formula": "(x - 127.0) / 128.0",`  
+    `"input_range": "0..255"`  
+  `},`  
+  `"thresholds": {`  
+    `"global": 0.52,`  
+    `"per_class": {`  
+      `"claseA": 0.60`  
+    `},`  
+    `"empty_result_message": "Sin etiquetas detectadas con suficiente confianza"`  
+  `},`  
+  `"provenance": {`  
+    `"trained_on": "dataset hash o timestamp",`  
+    `"seed": 1337`  
+  `}`  
+`}`
+
+* `output_is_logits=true`: si exportas logits y la inferencia aplica sigmoid.
+
+* Si decides exportar con sigmoid dentro del modelo, pon `output_is_logits=false`.
+
+## **13\) Anti‑overfitting (desde teacher hasta el final) — checklist obligatorio**
+
+Con \~1000 imágenes, esto no es opcional:
+
+1. **Transfer learning** (weights ImageNet) en teacher y student.
+
+2. **Freeze→unfreeze** por etapas (teacher y student).
+
+3. **Regularización**:
+
+   * Dropout en head (teacher 0.3–0.5; student 0.2–0.4)
+
+   * AdamW weight decay 1e-4
+
+   * EarlyStopping en `val_f1_macro`
+
+4. **Augmentations moderadas** (sin desalinear con letterbox)
+
+5. **MixUp opcional** (si hay mucho overfit)
+
+6. **Distillation** para suavizar y mejorar generalización
+
+7. **QAT con LR muy bajo** y pocas epochs
+
+8. **Selección de umbral** en VAL, reporte final en TEST
+
+## **14\) Pruebas mínimas (para asegurar compatibilidad con móvil)**
+
+El agente implementa estos “smoke tests”:
+
+### **14.1 `test_letterbox.py`**
+
+* Dada una imagen synthetic WxH, verificar:
+
+  * salida exactamente 240×240
+
+  * preserva aspecto (contenido centrado)
+
+  * padding negro
+
+### **14.2 `smoke_tflite.py`**
+
+* Cargar `model_qat_int8.tflite`
+
+* Alimentar 1 batch (uint8 0..255) con forma correcta
+
+* Confirmar:
+
+  * salida shape `[1,7]`
+
+  * lectura de quant params sin error
+
+### **14.3 `test_thresholds.py`**
+
+* Con un set pequeño de P y Y conocidos, validar que la búsqueda de umbral:
+
+  * es determinista
+
+  * maximiza f1\_macro correctamente
+
+---
+
+## **15\) Config por defecto recomendada (`configs/default.yaml`)**
+
+Valores iniciales realistas para el agente:
+
+* `seed: 1337`
+
+* `num_classes: 7`
+
+* Teacher:
+
+  * `input_size: 300`
+
+  * `batch_size: 16`
+
+  * `epochs_head: 10`
+
+  * `epochs_finetune: 30`
+
+  * `lr_head: 1e-3`
+
+  * `lr_finetune: 1e-4`
+
+  * `dropout: 0.4`
+
+* Student:
+
+  * `input_size: 240`
+
+  * `batch_size: 32` (CPU quizá 16\)
+
+  * `epochs_head: 10`
+
+  * `epochs_finetune: 40`
+
+  * `lr_head: 1e-3`
+
+  * `lr_finetune: 1e-4`
+
+  * `dropout: 0.3`
+
+* Distill:
+
+  * `alpha: 0.7`
+
+  * `temperature: 2.0`
+
+* QAT:
+
+  * `epochs: 10`
+
+  * `lr: 1e-5`
+
+* Threshold search:
+
+  * `grid_min: 0.05`
+
+  * `grid_max: 0.95`
+
+  * `grid_step: 0.01`
+
+  * `objective: f1_macro`
+
+## **16\) Notas importantes (decisiones explícitas para evitar sorpresas)**
+
+* **Sigmoid vs logits**: entrenar con logits \+ BCE(from\_logits=True) es más estable; luego en inferencia aplicas sigmoid. Esto encaja con tu requisito (“aplicar sigmoid si el modelo no la incluye”).
+
+* **EfficientNet‑Lite en Keras**: usa el paquete `efficientnet-lite-keras` que documenta input 240×240 (B1) y preprocesamiento a \[-1,1\]
+
+* **EfficientNet‑B3**: Keras indica que espera \[0..255\] y trae preprocesamiento incorporado
+
+* **QAT**: seguir el flujo oficial de TFMOT para fine‑tuning y export 
+

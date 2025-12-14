@@ -1,0 +1,474 @@
+### **Objetivo y contrato (qué hace el plugin)**
+* Recibe imágenes como `Uint8List` (bytes) sin importar su origen.
+* **No decodifica** imágenes en Dart (para rendimiento): pasa bytes comprimidos (JPG/PNG) al C engine para que él decodifique/preprocese.
+* Expone una API pública simple, asíncrona, que **no bloquea el UI thread**, usando un **Isolate persistente** y `TransferableTypedData`.
+* Convierte el resultado nativo a un modelo Dart extensible:
+  * lista de etiquetas con confianza
+  * errorCode / errorMessage
+  * (opcional) tiempos / versión / metadata (con `// TODO`)
+---
+## **2.1 Crear el plugin con la plantilla correcta**
+Usar la plantilla FFI oficial:
+`flutter create --platforms=android,ios --template=plugin_ffi image_recognition`
+Flutter documenta explícitamente `--template=plugin_ffi` para plugins con FFI. [Flutter Docs](https://docs.flutter.dev/platform-integration/ios/c-interop)
+Esto genera la estructura base de un plugin FFI (aunque luego reemplazaremos/ajustaremos partes).
+---
+## **2.2 Estructura final del paquete (profesional)**
+El agente debe dejar el repo así:
+`image_recognition/`  
+`├── lib/`  
+`│   ├── image_recognition.dart              # API pública (exports)`  
+`│   └── src/`  
+`│       ├── api/`  
+`│       │   └── image_recognition_client.dart`  
+`│       ├── ffi/`  
+`│       │   ├── bindings.g.dart             # generado por ffigen`  
+`│       │   ├── dylib_loader.dart`  
+`│       │   └── native_types.dart           # helpers para parsing`  
+`│       ├── isolate/`  
+`│       │   ├── worker.dart                 # isolate persistente`  
+`│       │   └── messages.dart               # protocolos (Map) sendables`  
+`│       ├── models/`  
+`│       │   ├── image_recognition_result.dart`  
+`│       │   ├── label_prediction.dart`  
+`│       │   ├── options.dart`  
+`│       │   └── errors.dart`  
+`│       └── util/`  
+`│           ├── asset_extractor.dart         # copia assets a file path`  
+`│           └── logger.dart`  
+`├── native/`  
+`│   └── include/`  
+`│       └── image_recognition.h             # contrato C estable (para ffigen)`  
+`├── android/`  
+`│   └── src/main/jniLibs/                   # aquí van .so por ABI`  
+`├── ios/`  
+`│   ├── Frameworks/                         # aquí va el .xcframework (recomendado)`  
+`│   └── image_recognition.podspec`  
+`├── example/`  
+`│   ├── lib/main.dart`  
+`│   ├── ios/Runner/Info.plist               # permisos cámara/galería`  
+`│   └── android/app/src/main/AndroidManifest.xml`  
+`├── ffigen.yaml`  
+`├── pubspec.yaml`  
+`└── README.md`
+---
+## **2.3 Contrato nativo (C header) — pieza clave para desarrollar en paralelo**
+Aunque “el motor C ya existirá”, para que el wrapper Flutter sea estable, el agente debe **fijar un header único** con la ABI exacta (y el motor C se ajusta a él).
+Crea: `native/include/image_recognition.h`
+`#pragma once`  
+`#include <stdint.h>`
+`#ifdef __cplusplus`  
+`extern "C" {`  
+`#endif`
+`// Export visible + "used" para evitar stripping en iOS/LTO`  
+`// Flutter recomienda marcar símbolos usados por Dart. :contentReference[oaicite:1]{index=1}`  
+`#if defined(_WIN32)`  
+  `#define IR_API __declspec(dllexport)`  
+`#else`  
+  `#define IR_API __attribute__((visibility("default"))) __attribute__((used))`  
+`#endif`
+`typedef struct {`  
+  `const char* label_utf8;   // puntero a string UTF-8 null-terminated`  
+  `float confidence;         // 0..1`  
+`} ir_label_prediction_t;`
+`typedef struct {`  
+  `int32_t error_code;       // 0 = OK`  
+  `const char* error_message_utf8; // nullable; UTF-8`  
+  `int32_t num_predictions;  // 0..N`  
+  `ir_label_prediction_t* predictions; // array length num_predictions`
+  `// Opcional: tiempos (microsegundos) y metadata`  
+  `int64_t preprocess_time_us;`  
+  `int64_t inference_time_us;`  
+  `int64_t postprocess_time_us;`  
+  `const char* model_version_utf8; // nullable`  
+`} ir_result_t;`
+`// Inicializa motor (carga modelo y config)`  
+`IR_API int32_t image_rec_init(const char* model_path_utf8,`  
+                             `const char* config_path_utf8);`
+`// Análisis desde bytes comprimidos (JPG/PNG/etc). Recomendado por rendimiento/memoria.`  
+`IR_API int32_t image_rec_analyze_image_bytes(const uint8_t* bytes,`  
+                                             `int32_t length,`  
+                                             `ir_result_t* out_result);`
+`// Libera SOLO memoria interna apuntada por out_result (predictions, error_message, etc).`  
+`// NO debe free() el puntero out_result en sí (lo maneja el caller).`  
+`IR_API void image_rec_free_result(ir_result_t* result);`
+`// Cierra motor, libera caches/interpreters, etc.`  
+`IR_API void image_rec_shutdown(void);`
+`// Opcionales (si existen, el wrapper puede llamarlas)`  
+`IR_API int32_t image_rec_set_num_threads(int32_t n);`  
+`IR_API int32_t image_rec_warmup(void);`
+`#ifdef __cplusplus`  
+`}`  
+`#endif`
+**Reglas del contrato (para evitar leaks y crashes):**
+1. `image_rec_analyze_image_bytes` **no retiene** el puntero `bytes` después de retornar (copia si lo necesita).
+2. `image_rec_free_result` libera:
+   * `result->predictions` (si fue asignado)
+   * `result->error_message_utf8` (si fue asignado dinámicamente)
+   * NO libera `label_utf8` si apunta a memoria estática interna (recomendado).
+3. El motor debe exportar símbolos con visibilidad para Dart; Flutter recomienda atributos para evitar stripping. [Flutter Docs](https://docs.flutter.dev/platform-integration/ios/c-interop)
+---
+## **2.4 Generación automática de bindings con `ffigen`**
+### **2.4.1 Dependencias**
+En `pubspec.yaml` del plugin:
+* `dependencies`:
+  * `ffi: ^2.0.0` (o compatible)
+  * `meta`
+  * `path`
+  * `path_provider` (para extraer assets a archivos)
+* `dev_dependencies`:
+  * `ffigen`
+  * `flutter_lints`
+  * `test`
+`ffigen` soporta config YAML, aunque la doc advierte que eventualmente se favorecerá la API de Dart. [Dart packages](https://pub.dev/packages/ffigen?utm_source=chatgpt.com)
+### **2.4.2 `ffigen.yaml`**
+Crear en raíz:
+`output: 'lib/src/ffi/bindings.g.dart'`  
+`headers:`  
+  `entry-points:`  
+    `- 'native/include/image_recognition.h'`  
+`include-directives:`  
+  `- 'native/include/image_recognition.h'`  
+`comments:`  
+  `style: any`  
+  `length: full`  
+`preamble: |`  
+  `// AUTO-GENERATED FILE, DO NOT EDIT.`  
+  `// Generated by ffigen.`  
+  `// ignore_for_file: always_specify_types`  
+  `// ignore_for_file: camel_case_types`  
+  `// ignore_for_file: non_constant_identifier_names`
+La estructura es consistente con ejemplos oficiales de codelabs. [GitHub+1](https://github.com/flutter/codelabs/blob/main/ffigen_codelab/step_05/ffigen.yaml?utm_source=chatgpt.com)
+### **2.4.3 Comando generación**
+`dart run ffigen --config ffigen.yaml`
+---
+## **2.5 Carga de la librería nativa (Android vs iOS)**
+Crear: `lib/src/ffi/dylib_loader.dart`
+Regla:
+* **Android**: `DynamicLibrary.open('libimage_recognition.so')`
+* **iOS**: si está **estáticamente linkeada** o ya cargada por el proceso → `DynamicLibrary.process()` (Flutter lo menciona explícitamente). [Flutter Docs](https://docs.flutter.dev/platform-integration/ios/c-interop)
+Ejemplo:
+`import 'dart:ffi';`  
+`import 'dart:io';`
+`DynamicLibrary openImageRecognitionLib() {`  
+  `if (Platform.isAndroid) {`  
+    `return DynamicLibrary.open('libimage_recognition.so');`  
+  `}`  
+  `if (Platform.isIOS) {`  
+    `return DynamicLibrary.process();`  
+  `}`  
+  `throw UnsupportedError('Platform not supported');`  
+`}`
+---
+## **2.6 API pública (Dart) — simple pero extensible**
+Archivo: `lib/image_recognition.dart`
+Debe exportar el cliente y modelos:
+`library image_recognition;`
+`export 'src/api/image_recognition_client.dart';`  
+`export 'src/models/image_recognition_result.dart';`  
+`export 'src/models/label_prediction.dart';`  
+`export 'src/models/options.dart';`  
+`export 'src/models/errors.dart';`
+### **2.6.1 Modelos**
+`LabelPrediction` (`lib/src/models/label_prediction.dart`):
+`class LabelPrediction {`  
+  `final String label;`  
+  `final double confidence; // 0..1`
+  `const LabelPrediction({required this.label, required this.confidence});`
+  `Map<String, dynamic> toJson() => {`  
+    `'label': label,`  
+    `'confidence': confidence,`  
+  `};`
+  `factory LabelPrediction.fromJson(Map<String, dynamic> json) =>`  
+      `LabelPrediction(`  
+        `label: json['label'] as String,`  
+        `confidence: (json['confidence'] as num).toDouble(),`  
+      `);`  
+`}`
+`ImageRecognitionResult` (`lib/src/models/image_recognition_result.dart`):
+`class ImageRecognitionResult {`  
+  `final List<LabelPrediction> predictions;`  
+  `final int errorCode; // 0 = ok`  
+  `final String? errorMessage;`
+  `// TODO: agregar tiempos (preprocess/inference/postprocess) si el motor los retorna`  
+  `final int? preprocessTimeUs;`  
+  `final int? inferenceTimeUs;`  
+  `final int? postprocessTimeUs;`
+  `// TODO: version/metadata (model_version, threshold_version, etc.)`  
+  `final String? modelVersion;`
+  `const ImageRecognitionResult({`  
+    `required this.predictions,`  
+    `required this.errorCode,`  
+    `this.errorMessage,`  
+    `this.preprocessTimeUs,`  
+    `this.inferenceTimeUs,`  
+    `this.postprocessTimeUs,`  
+    `this.modelVersion,`  
+  `});`
+  `bool get ok => errorCode == 0;`  
+  `bool get isEmpty => ok && predictions.isEmpty;`
+  `Map<String, dynamic> toJson() => {`  
+    `'predictions': predictions.map((e) => e.toJson()).toList(),`  
+    `'errorCode': errorCode,`  
+    `'errorMessage': errorMessage,`  
+    `'preprocessTimeUs': preprocessTimeUs,`  
+    `'inferenceTimeUs': inferenceTimeUs,`  
+    `'postprocessTimeUs': postprocessTimeUs,`  
+    `'modelVersion': modelVersion,`  
+  `};`
+  `factory ImageRecognitionResult.fromJson(Map<String, dynamic> json) =>`  
+      `ImageRecognitionResult(`  
+        `predictions: (json['predictions'] as List<dynamic>)`  
+            `.map((e) => LabelPrediction.fromJson(e as Map<String, dynamic>))`  
+            `.toList(),`  
+        `errorCode: json['errorCode'] as int,`  
+        `errorMessage: json['errorMessage'] as String?,`  
+        `preprocessTimeUs: json['preprocessTimeUs'] as int?,`  
+        `inferenceTimeUs: json['inferenceTimeUs'] as int?,`  
+        `postprocessTimeUs: json['postprocessTimeUs'] as int?,`  
+        `modelVersion: json['modelVersion'] as String?,`  
+      `);`  
+`}`
+### **2.6.2 Cliente público**
+`lib/src/api/image_recognition_client.dart`:
+Requisitos:
+* `initFromAssets(...)` (copia assets a archivos)
+* `initFromFilePaths(...)`
+* `analyze(Uint8List imageBytes)` (principal, bytes comprimidos)
+* `dispose()`
+---
+## **2.7 Extracción de assets a archivos (necesario para el motor C)**
+El motor C necesita `model_path` y `config_path` reales. En Flutter, assets no son “archivos” accesibles por path, por eso el plugin debe copiarlos a un directorio local.
+Crear: `lib/src/util/asset_extractor.dart`
+Regla:
+* Copiar una sola vez (cache).
+* Si cambian los bytes (hash), reemplazar.
+Pseudo-implementación:
+1. `ByteData data = await rootBundle.load(assetPath);`
+2. `Directory dir = await getApplicationSupportDirectory();`
+3. `File out = File('${dir.path}/image_recognition/<basename>');`
+4. si no existe o hash difiere → `out.writeAsBytes(...)`
+Esto además ayuda al rendimiento (evita copias repetidas).
+---
+## **2.8 Rendimiento: Isolate persistente \+ TransferableTypedData (SOTA)**
+**No** hagas `Isolate.spawn` por cada inferencia: es caro.  
+ Haz **1 isolate persistente** que:
+* carga `DynamicLibrary`
+* llama `image_rec_init(...)` una vez
+* procesa requests secuenciales
+* mantiene buffers reutilizables
+### **2.8.1 Protocolo de mensajes (solo objetos sendables)**
+Crear: `lib/src/isolate/messages.dart`
+Usar Map con claves string:
+* request:
+  * `{'id': int, 'type': 'init'|'analyze'|'shutdown', 'payload': {...}}`
+* analyze payload:
+  * `{'bytes': TransferableTypedData, 'format': 'jpeg'}` (por ahora)
+* response:
+  * `{'id': int, 'ok': bool, 'result': Map<String,dynamic>}`
+### **2.8.2 Worker isolate**
+Crear: `lib/src/isolate/worker.dart`
+Características obligatorias:
+* Mantiene un `Pointer<Uint8>` buffer reutilizable:
+  * `_bufPtr`, `_bufCap`
+  * si `len > _bufCap` → realloc (free \+ malloc)
+* Mantiene un `Pointer<ir_result_t>` reutilizable:
+  * `_resultPtr = calloc<ir_result_t>()`
+  * tras parseo llamar `image_rec_free_result(_resultPtr)`
+* Serializa llamadas (una a la vez) para evitar condiciones de carrera.
+* Siempre `try/finally` para liberar.
+---
+## **2.9 Implementación FFI (Dart) dentro del isolate**
+Archivo: `lib/src/ffi/native_types.dart` con helpers:
+* `String? readNullableUtf8(Pointer<Char> p)`
+* conversiones seguras
+En el isolate:
+1. `final dylib = openImageRecognitionLib();`
+2. `final bindings = ImageRecognitionBindings(dylib);` (de `bindings.g.dart`)
+3. init:
+   * convertir paths a `Utf8` con `toNativeUtf8()`
+   * llamar `image_rec_init`
+   * liberar strings con `malloc.free`
+4. analyze:
+   * `TransferableTypedData` → `Uint8List`
+   * copiar a buffer `_bufPtr.asTypedList(len).setAll(0, bytes)`
+   * llamar `image_rec_analyze_image_bytes(_bufPtr, len, _resultPtr)`
+   * parsear:
+     * `num_predictions`
+     * array `predictions`
+     * construir lista `[{label, confidence}]`
+   * llamar `image_rec_free_result(_resultPtr)` (siempre)
+   * responder al main isolate
+---
+## **2.10 API pública: clase `ImageRecognition`**
+Archivo: `lib/src/api/image_recognition_client.dart`
+Recomendación: un wrapper con estado y worker:
+`class ImageRecognition {`  
+  `final _worker = ImageRecognitionWorker();`
+  `bool _initialized = false;`
+  `Future<void> initFromAssets({`  
+    `required String modelAssetPath,`  
+    `required String configAssetPath,`  
+    `int? numThreads,`  
+  `}) async {`  
+    `final modelPath = await extractAssetToFile(modelAssetPath);`  
+    `final configPath = await extractAssetToFile(configAssetPath);`  
+    `await initFromFilePaths(modelPath: modelPath, configPath: configPath, numThreads: numThreads);`  
+  `}`
+  `Future<void> initFromFilePaths({`  
+    `required String modelPath,`  
+    `required String configPath,`  
+    `int? numThreads,`  
+  `}) async {`  
+    `await _worker.start();`  
+    `final res = await _worker.init(modelPath: modelPath, configPath: configPath, numThreads: numThreads);`  
+    `_initialized = res;`  
+  `}`
+  `Future<ImageRecognitionResult> analyze(Uint8List imageBytes) async {`  
+    `if (!_initialized) {`  
+      `return const ImageRecognitionResult(`  
+        `predictions: [],`  
+        `errorCode: 1001,`  
+        `errorMessage: 'Engine not initialized',`  
+      `);`  
+    `}`  
+    `return _worker.analyzeJpegBytes(imageBytes);`  
+  `}`
+  `Future<void> dispose() async {`  
+    `await _worker.shutdown();`  
+    `_initialized = false;`  
+  `}`  
+`}`
+---
+## **2.11 Android: dónde poner `libimage_recognition.so` y configuración Gradle**
+### **2.11.1 Estructura ABI obligatoria**
+Copiar los `.so` aquí:
+`android/src/main/jniLibs/`  
+`├── arm64-v8a/libimage_recognition.so`  
+`├── armeabi-v7a/libimage_recognition.so`  
+`├── x86_64/libimage_recognition.so`  
+`└── x86/libimage_recognition.so`
+### **2.11.2 `android/build.gradle` del plugin**
+Asegurar:
+* `minSdkVersion 21`
+* `jniLibs.srcDirs` y `abiFilters`
+Ejemplo (ajusta al archivo real generado por Flutter):
+`android {`  
+  `defaultConfig {`  
+    `minSdkVersion 21`  
+    `ndk {`  
+      `abiFilters "arm64-v8a", "armeabi-v7a", "x86_64", "x86"`  
+    `}`  
+  `}`
+  `sourceSets {`  
+    `main {`  
+      `jniLibs.srcDirs = ['src/main/jniLibs']`  
+    `}`  
+  `}`  
+`}`
+---
+## **2.12 iOS: `.xcframework` recomendado \+ `podspec`**
+Flutter explica la diferencia entre linking estático/dinámico y el uso de `DynamicLibrary.process()`/`open()`. [Flutter Docs](https://docs.flutter.dev/platform-integration/ios/c-interop)
+### **2.12.1 Ubicación recomendada**
+Coloca tu binario como:
+`ios/Frameworks/image_recognition.xcframework`
+(Esto suele ser lo más limpio para device+simulator)
+### **2.12.2 `ios/image_recognition.podspec`**
+Asegurar:
+* iOS 12+
+* `vendored_frameworks`
+Ejemplo:
+`Pod::Spec.new do |s|`  
+  `s.name             = 'image_recognition'`  
+  `s.version          = '0.0.1'`  
+  `s.summary          = 'Flutter FFI wrapper for multi-label image recognition engine.'`  
+  `s.description      = 'FFI plugin that calls a native C engine.'`  
+  `s.homepage         = 'https://example.invalid'`  
+  `s.license          = { :file => '../LICENSE' }`  
+  `s.author           = { 'YourOrg' => 'dev@yourorg.com' }`  
+  `s.source           = { :path => '.' }`
+  `s.ios.deployment_target = '12.0'`  
+  `s.dependency 'Flutter'`
+  `# Binario precompilado`  
+  `s.vendored_frameworks = 'Frameworks/image_recognition.xcframework'`
+  `# Si tu engine usa C++ internamente, a veces necesitas:`  
+  `# s.libraries = 'c++'`
+  `s.source_files = 'Classes/**/*'`  
+`end`
+**Nota de robustez (release iOS):**
+* Flutter menciona que en release iOS los símbolos pueden strippearse y recomienda asegurar visibilidad y evitar descarte. [Flutter Docs](https://docs.flutter.dev/platform-integration/ios/c-interop)
+* Por eso el header exige `visibility("default")` y `used`.
+---
+## **2.13 Manejo de errores y “sin etiquetas”**
+Reglas en Dart:
+* `errorCode == 0` → OK
+* `predictions.isEmpty` y OK → UI debe mostrar: **“No se detectaron etiquetas con suficiente confianza”** (mensaje fijo o retornado por el motor/config).
+* Si `errorCode != 0` → mostrar `errorMessage` (si existe) y permitir reintentar.
+---
+## **2.14 App de ejemplo (`example/`) — cámara \+ galería \+ UI limpia**
+### **2.14.1 Dependencias example**
+En `example/pubspec.yaml`:
+* `image_picker`
+* `path_provider`
+* `image_recognition: { path: ../ }`
+### **2.14.2 Permisos**
+**iOS** (`Info.plist`):
+* `NSCameraUsageDescription`
+* `NSPhotoLibraryUsageDescription`
+**Android**: `image_picker` gestiona, pero valida manifiesto según la versión.
+### **2.14.3 Flujo UI**
+Pantalla única:
+1. Botón “Cámara”
+2. Botón “Galería”
+3. Preview de imagen seleccionada
+4. Botón “Analizar”
+5. Resultados:
+   * lista de chips/tiles: `label` \+ `%`
+   * si vacío: texto “No se detectaron…”
+   * si error: banner rojo con mensaje
+6. Mostrar tiempo total medido en Dart con `Stopwatch`
+### **2.14.4 Ejemplo de `main.dart` (esqueleto)**
+* Al seleccionar imagen, leer como bytes:
+  * si es `XFile file`, `await file.readAsBytes()`
+* Llamar `await recognizer.analyze(bytes)`
+---
+## **2.15 Checklist de rendimiento (para cumplir \<200ms en gama media)**
+El agente debe implementar estas optimizaciones:
+1. **No decodificar en Dart**: pasar JPEG/PNG directo (menos bytes, menos copias).
+2. `TransferableTypedData` para pasar bytes al isolate sin copiado extra.
+3. Isolate persistente (no spawn por request).
+4. Reutilizar:
+   * buffer nativo input (`Pointer<Uint8>`)
+   * struct result (`Pointer<ir_result_t>`)
+5. Inicializar una vez \+ `warmup` opcional.
+6. Evitar logs en hot path en release.
+---
+## **2.16 README.md (obligatorio)**
+Debe incluir:
+* Qué hace el plugin (multi-label, confidences, thresholds viven en el motor/config)
+* Instalación:
+  * `pubspec.yaml` \+ `flutter pub get`
+* Dónde copiar binarios:
+  * Android `android/src/main/jniLibs/<abi>/libimage_recognition.so`
+  * iOS `ios/Frameworks/image_recognition.xcframework`
+* Cómo inicializar modelo/config:
+  * `initFromAssets(modelAssetPath, configAssetPath)`
+  * o `initFromFilePaths`
+* Ejemplo mínimo de uso
+* Troubleshooting:
+  * “Engine not initialized”
+  * “Symbol not found” (iOS stripping / linking)
+  * “UnsatisfiedLinkError” (Android ABI mismatch)
+---
+## **2.17 Entregables esperados (del agente móvil)**
+1. Plugin Flutter `image_recognition` compilable en iOS/Android
+2. Bridge FFI con `ffigen`
+3. Manejo de memoria correcto (sin leaks)
+4. Isolate persistente \+ `TransferableTypedData`
+5. `example/` funcional:
+   * cámara/galería
+   * preview
+   * resultados
+   * “sin etiquetas”
+   * tiempos y errores
+
