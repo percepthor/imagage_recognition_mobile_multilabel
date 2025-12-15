@@ -303,89 +303,46 @@ class _ImageRecognitionDemoState extends State<ImageRecognitionDemo> {
                       ),
                       const Divider(),
 
-                      if (_result!.isEmpty)
-                        const Padding(
-                          padding: EdgeInsets.all(16.0),
-                          child: Center(
-                            child: Column(
-                              children: [
-                                Icon(
-                                  Icons.check_circle_outline,
-                                  size: 48,
-                                  color: Colors.green,
-                                ),
-                                SizedBox(height: 8),
-                                Text(
-                                  '✓ Imagen OK',
-                                  style: TextStyle(
-                                    fontSize: 18,
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.green,
-                                  ),
-                                ),
-                                SizedBox(height: 4),
-                                Text(
-                                  'No se detectaron problemas',
-                                  style: TextStyle(
-                                    fontStyle: FontStyle.italic,
-                                    color: Colors.grey,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        )
-                      else ...[
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 8.0),
-                          child: Text(
-                            '⚠️ Se detectaron ${_result!.predictions.length} problema(s):',
-                            style: const TextStyle(
-                              fontWeight: FontWeight.bold,
-                              color: Colors.orange,
-                            ),
-                          ),
-                        ),
-                        ...List.generate(_result!.predictions.length, (index) {
-                          final prediction = _result!.predictions[index];
-                          return Card(
-                            margin: const EdgeInsets.only(bottom: 8),
-                            color: Colors.orange.shade50,
-                            child: ListTile(
-                              leading: CircleAvatar(
-                                backgroundColor: Colors.orange,
-                                child: Text(
-                                  '#${index + 1}',
-                                  style: const TextStyle(color: Colors.white),
-                                ),
+                      // Mostrar todas las 7 clases con sus probabilidades
+                      ...List.generate(_result!.predictions.length, (index) {
+                        final prediction = _result!.predictions[index];
+                        return Card(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          color: Colors.blue.shade50,
+                          child: ListTile(
+                            leading: CircleAvatar(
+                              backgroundColor: Colors.blue,
+                              child: Text(
+                                '#${index + 1}',
+                                style: const TextStyle(color: Colors.white),
                               ),
-                              title: Text(
-                                prediction.label,
-                                style: const TextStyle(
+                            ),
+                            title: Text(
+                              prediction.label,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            trailing: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 6,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.blue.shade200,
+                                borderRadius: BorderRadius.circular(16),
+                              ),
+                              child: Text(
+                                '${(prediction.confidence * 100).toStringAsFixed(1)}%',
+                                style: TextStyle(
+                                  color: Colors.blue.shade900,
                                   fontWeight: FontWeight.bold,
                                 ),
                               ),
-                              trailing: Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 12,
-                                  vertical: 6,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: Colors.orange.shade200,
-                                  borderRadius: BorderRadius.circular(16),
-                                ),
-                                child: Text(
-                                  '${(prediction.confidence * 100).toStringAsFixed(1)}%',
-                                  style: TextStyle(
-                                    color: Colors.orange.shade900,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                              ),
                             ),
-                          );
-                        }),
-                      ],
+                          ),
+                        );
+                      }),
                     ],
                   ),
                 ),

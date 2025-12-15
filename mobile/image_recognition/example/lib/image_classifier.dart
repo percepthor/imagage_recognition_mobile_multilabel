@@ -163,7 +163,7 @@ class ImageClassifier {
     return buffer.buffer;
   }
 
-  /// Postprocesamiento: dequantizar, sigmoid y aplicar thresholds
+  /// Postprocesamiento: dequantizar y sigmoid (devuelve TODAS las clases)
   List<Prediction> _postprocess(Uint8List output) {
     final predictions = <Prediction>[];
 
@@ -175,13 +175,11 @@ class ImageClassifier {
       // Aplicar sigmoid
       final probability = _sigmoid(dequantized);
 
-      // Aplicar threshold
-      if (probability >= _thresholds[i]) {
-        predictions.add(Prediction(
-          label: _labels[i],
-          confidence: probability,
-        ));
-      }
+      // Agregar TODAS las clases (no solo las que superan threshold)
+      predictions.add(Prediction(
+        label: _labels[i],
+        confidence: probability,
+      ));
     }
 
     // Ordenar por confianza descendente
