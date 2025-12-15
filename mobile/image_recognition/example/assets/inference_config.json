@@ -1,0 +1,73 @@
+{
+  "model": {
+    "filename": "model_qat_int8.tflite",
+    "num_classes": 7,
+    "output_activation": "sigmoid",
+    "output_is_logits": true,
+    "quantization": {
+      "input": {
+        "dtype": "<class 'numpy.uint8'>",
+        "scale": 0.003921568859368563,
+        "zero_point": 0
+      },
+      "output": {
+        "dtype": "<class 'numpy.int8'>",
+        "scale": 0.05630883574485779,
+        "zero_point": 1
+      }
+    }
+  },
+  "labels": {
+    "filename": "labels.txt",
+    "order": "file_order",
+    "classes": [
+      "cortadas",
+      "fraude",
+      "noesproducto",
+      "obscuras",
+      "puerta_abierta",
+      "puerta_cerrada",
+      "reflejos"
+    ]
+  },
+  "preprocess": {
+    "color_space": "RGB",
+    "input_size": 240,
+    "resize": {
+      "mode": "keep_aspect_letterbox",
+      "interpolation": "bilinear",
+      "pad_value_rgb": [
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "normalize": {
+    "scheme": "efficientnet_lite",
+    "formula": "(x - 127.0) / 128.0",
+    "input_range": "0..255",
+    "note": "For uint8 input, the model handles quantization internally"
+  },
+  "thresholds": {
+    "global": 0.27,
+    "per_class": {
+      "cortadas": 0.26000000000000006,
+      "fraude": 0.31000000000000005,
+      "noesproducto": 0.05,
+      "obscuras": 0.060000000000000005,
+      "puerta_abierta": 0.52,
+      "puerta_cerrada": 0.34,
+      "reflejos": 0.11000000000000001
+    },
+    "use_per_class": true,
+    "empty_result_message": "Sin etiquetas detectadas con suficiente confianza"
+  },
+  "provenance": {
+    "trained_on": "dataset_1765770249",
+    "seed": 1337,
+    "generated_at": "2025-12-15 03:44:09",
+    "optimization_target": "f1_macro",
+    "calibration_notes": "Optimized on VAL set using f1_macro. Per-class thresholds enabled (improvement >=0.5%)."
+  }
+}

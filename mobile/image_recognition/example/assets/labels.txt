@@ -1,0 +1,7 @@
+cortadas
+fraude
+noesproducto
+obscuras
+puerta_abierta
+puerta_cerrada
+reflejos
