@@ -52,8 +52,32 @@ def apply_qat_to_student(
     # ========== Apply QAT ==========
     logger.info("\nApplying QAT transformations to model...")
 
-    # Apply quantization to the entire model
-    qat_model = tfmot.quantization.keras.quantize_model(student_model)
+    # Clone model to ensure it's a proper Functional model
+    # This is needed because tfmot.quantize_model requires Sequential or Functional
+    try:
+        cloned_model = keras.models.clone_model(student_model)
+        cloned_model.set_weights(student_model.get_weights())
+        logger.info("Cloned model for QAT compatibility")
+    except Exception as e:
+        logger.warning(f"Could not clone model: {e}. Using original.")
+        cloned_model = student_model
+
+    # Apply quantization to the entire model with default 8-bit scheme
+    logger.info("Applying default 8-bit quantization scheme...")
+    try:
+        qat_model = tfmot.quantization.keras.quantize_model(cloned_model)
+        logger.info("QAT applied successfully with quantize_model()")
+    except Exception as e:
+        logger.warning(f"quantize_model failed: {e}")
+        logger.info("Trying annotate + quantize_apply approach...")
+        # Try alternative approach: annotate and then quantize
+        try:
+            annotated_model = tfmot.quantization.keras.quantize_annotate_model(cloned_model)
+            qat_model = tfmot.quantization.keras.quantize_apply(annotated_model)
+            logger.info("QAT applied successfully with annotate + apply")
+        except Exception as e2:
+            logger.error(f"Both QAT approaches failed: {e2}")
+            raise RuntimeError(f"QAT failed: {e2}")
 
     logger.info(f"QAT model created")
     logger.info(f"  Original params: {student_model.count_params():,}")
@@ -63,11 +87,19 @@ def apply_qat_to_student(
     logger.info("\nCompiling QAT model...")
 
     # Use very low learning rate for QAT fine-tuning
-    qat_model.compile(
-        optimizer=keras.optimizers.AdamW(
+    # Use experimental.AdamW for TF 2.10 compatibility
+    try:
+        qat_optimizer = keras.optimizers.AdamW(
             learning_rate=qat_config['lr'],
             weight_decay=student_config.get('weight_decay', 1e-4)
-        ),
+        )
+    except AttributeError:
+        qat_optimizer = keras.optimizers.experimental.AdamW(
+            learning_rate=qat_config['lr'],
+            weight_decay=student_config.get('weight_decay', 1e-4)
+        )
+    qat_model.compile(
+        optimizer=qat_optimizer,
         loss=keras.losses.BinaryCrossentropy(from_logits=True),
         metrics=[
             keras.metrics.BinaryAccuracy(name='accuracy'),
@@ -88,7 +120,7 @@ def apply_qat_to_student(
     callbacks_qat = create_standard_callbacks(
         config=qat_config,
         monitor='val_loss',
-        checkpoint_path=out_dir / 'student_qat_best.h5',
+        checkpoint_path=out_dir / 'student_qat_best.keras',
         validation_data=val_dataset,
         log_dir=out_dir / 'logs_qat'
     )
@@ -109,9 +141,10 @@ def apply_qat_to_student(
     logger.info(f"  Best val_loss: {min(history_qat.history['val_loss']):.4f}")
 
     # ========== Save QAT Model ==========
-    final_path = out_dir / 'student_qat_final.h5'
-    qat_model.save(final_path)
-    logger.info(f"\nSaved QAT model to: {final_path}")
+    # Save weights only for TF 2.10 compatibility
+    final_path = out_dir / 'student_qat_final.weights.h5'
+    qat_model.save_weights(final_path)
+    logger.info(f"\nSaved QAT weights to: {final_path}")
 
     # ========== QAT Summary ==========
     logger.info("\n" + "=" * 80)
@@ -119,7 +152,7 @@ def apply_qat_to_student(
     logger.info("=" * 80)
     logger.info(f"Total QAT epochs: {qat_config['epochs']}")
     logger.info(f"Models saved:")
-    logger.info(f"  - {out_dir / 'student_qat_best.h5'} (best)")
+    logger.info(f"  - {out_dir / 'student_qat_best.weights.h5'} (best)")
     logger.info(f"  - {final_path} (final)")
     logger.info(f"\nNext step: Export to TFLite INT8")
 
@@ -173,12 +206,19 @@ def apply_qat_with_distillation(
         temperature=distill_config['temperature']
     )
 
-    # Compile
-    distill_qat_model.compile(
-        optimizer=keras.optimizers.AdamW(
+    # Compile - Use experimental.AdamW for TF 2.10 compatibility
+    try:
+        qat_distill_optimizer = keras.optimizers.AdamW(
             learning_rate=qat_config['lr'],
             weight_decay=config['student'].get('weight_decay', 1e-4)
-        ),
+        )
+    except AttributeError:
+        qat_distill_optimizer = keras.optimizers.experimental.AdamW(
+            learning_rate=qat_config['lr'],
+            weight_decay=config['student'].get('weight_decay', 1e-4)
+        )
+    distill_qat_model.compile(
+        optimizer=qat_distill_optimizer,
         loss=keras.losses.BinaryCrossentropy(from_logits=True),
         metrics=[
             keras.metrics.BinaryAccuracy(name='accuracy'),
@@ -191,7 +231,7 @@ def apply_qat_with_distillation(
     callbacks = create_standard_callbacks(
         config=qat_config,
         monitor='val_loss',
-        checkpoint_path=out_dir / 'student_qat_distill_best.h5',
+        checkpoint_path=out_dir / 'student_qat_distill_best.keras',
         log_dir=out_dir / 'logs_qat_distill'
     )
 
@@ -208,10 +248,10 @@ def apply_qat_with_distillation(
     # Extract QAT student
     qat_model = distill_qat_model.student
 
-    # Save
-    final_path = out_dir / 'student_qat_distill_final.h5'
-    qat_model.save(final_path)
-    logger.info(f"\nSaved QAT model (with distillation) to: {final_path}")
+    # Save weights only for TF 2.10 compatibility
+    final_path = out_dir / 'student_qat_distill_final.weights.h5'
+    qat_model.save_weights(final_path)
+    logger.info(f"\nSaved QAT weights (with distillation) to: {final_path}")
 
     logger.info("\nQAT + Distillation complete!")
     logger.info(f"  Best val_loss: {min(history.history['val_loss']):.4f}")

@@ -155,10 +155,18 @@ def compile_teacher(
         weight_decay: Weight decay for AdamW
     """
     # Optimizer: AdamW with weight decay
-    optimizer = keras.optimizers.AdamW(
-        learning_rate=learning_rate,
-        weight_decay=weight_decay
-    )
+    # Use experimental.AdamW for TF 2.10 compatibility
+    try:
+        optimizer = keras.optimizers.AdamW(
+            learning_rate=learning_rate,
+            weight_decay=weight_decay
+        )
+    except AttributeError:
+        # TF 2.10 has AdamW in experimental module
+        optimizer = keras.optimizers.experimental.AdamW(
+            learning_rate=learning_rate,
+            weight_decay=weight_decay
+        )
 
     # Loss: Binary cross-entropy with logits (multi-label)
     loss = keras.losses.BinaryCrossentropy(from_logits=True)

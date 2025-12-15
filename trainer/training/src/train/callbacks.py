@@ -142,16 +142,22 @@ class DetailedLoggingCallback(keras.callbacks.Callback):
         if 'val_f1_macro' in logs:
             logger.info(f"  Val F1:     {logs.get('val_f1_macro', 0):.4f}")
 
-        # Store logs
-        self.epoch_logs.append({
-            'epoch': epoch + 1,
-            **logs
-        })
+        # Store logs - convert tensors to Python types for JSON serialization
+        serializable_logs = {'epoch': epoch + 1}
+        for key, value in logs.items():
+            if hasattr(value, 'numpy'):
+                serializable_logs[key] = float(value.numpy())
+            elif isinstance(value, (np.floating, np.integer)):
+                serializable_logs[key] = float(value)
+            else:
+                serializable_logs[key] = value
+        self.epoch_logs.append(serializable_logs)
 
     def on_train_end(self, logs=None):
         """Save training history."""
         if self.log_dir:
             import json
+            self.log_dir.mkdir(parents=True, exist_ok=True)
             history_path = self.log_dir / 'training_history.json'
             with open(history_path, 'w') as f:
                 json.dump(self.epoch_logs, f, indent=2)
@@ -205,18 +211,20 @@ def create_standard_callbacks(
         )
         logger.info(f"Added ReduceLROnPlateau (patience={config['reduce_lr_patience']})")
 
-    # Model checkpoint
+    # Model checkpoint - use save_weights_only for TF 2.10 JSON serialization compatibility
     if checkpoint_path:
+        # Change extension from .keras to .weights.h5 for weights-only saving
+        weights_path = str(checkpoint_path).replace('.keras', '.weights.h5')
         callbacks.append(
             keras.callbacks.ModelCheckpoint(
-                filepath=checkpoint_path,
+                filepath=weights_path,
                 monitor=monitor,
                 save_best_only=True,
-                save_weights_only=False,
+                save_weights_only=True,
                 verbose=1
             )
         )
-        logger.info(f"Added ModelCheckpoint (monitor={monitor})")
+        logger.info(f"Added ModelCheckpoint (monitor={monitor}, weights_only)")
 
     # F1 Macro callback (if validation data provided)
     if validation_data is not None and monitor == 'val_f1_macro':
@@ -228,19 +236,20 @@ def create_standard_callbacks(
         )
         logger.info(f"Added F1MacroCallback")
 
-    # TensorBoard (if log_dir provided)
-    if log_dir:
-        tb_path = Path(log_dir) / 'tensorboard'
-        tb_path.mkdir(parents=True, exist_ok=True)
-        callbacks.append(
-            keras.callbacks.TensorBoard(
-                log_dir=str(tb_path),
-                histogram_freq=1,
-                write_graph=True,
-                update_freq='epoch'
-            )
-        )
-        logger.info(f"Added TensorBoard (log_dir={tb_path})")
+    # TensorBoard disabled for TF 2.10 compatibility
+    # TODO: Re-enable when migrating to newer TF version
+    # if log_dir:
+    #     tb_path = Path(log_dir) / 'tensorboard'
+    #     tb_path.mkdir(parents=True, exist_ok=True)
+    #     callbacks.append(
+    #         keras.callbacks.TensorBoard(
+    #             log_dir=str(tb_path),
+    #             histogram_freq=0,
+    #             write_graph=False,
+    #             update_freq='epoch'
+    #         )
+    #     )
+    #     logger.info(f"Added TensorBoard (log_dir={tb_path})")
 
     # Detailed logging
     callbacks.append(

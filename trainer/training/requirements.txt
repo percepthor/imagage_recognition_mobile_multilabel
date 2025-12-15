@@ -1,9 +1,9 @@
-tensorflow==2.16.1
-tensorflow-model-optimization
+tensorflow==2.10.0
+tensorflow-model-optimization==0.7.5
+git+https://github.com/sebastian-sz/efficientnet-lite-keras@main
 scikit-learn
 opencv-python-headless
 pyyaml
 numpy
 matplotlib
 seaborn
-git+https://github.com/sebastian-sz/efficientnet-lite-keras@main

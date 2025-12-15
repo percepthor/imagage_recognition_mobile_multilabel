@@ -285,7 +285,7 @@ def optimize_thresholds(
         'calibration_notes': (
             f"Optimized on VAL set using {objective}. "
             f"Per-class thresholds {'enabled' if use_per_class else 'disabled'} "
-            f"(improvement {'>='{improvement_threshold:.1%} if use_per_class else '<' + f{improvement_threshold:.1%}})."
+            f"(improvement {'>=' + f'{improvement_threshold:.1%}' if use_per_class else '<' + f'{improvement_threshold:.1%}'})."
         )
     }
 

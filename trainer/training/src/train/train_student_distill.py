@@ -142,10 +142,13 @@ def train_student_with_distillation(
     train_dataset,
     val_dataset,
     out_dir: Path,
-    num_classes: int = 7
+    num_classes: int = 7,
+    strategy=None
 ):
     """
     Train student model with knowledge distillation from teacher.
+
+    Supports multi-GPU with tf.distribute.Strategy.
 
     Phase A: Warmup head only (backbone frozen)
     Phase B: Fine-tune with distillation (partial backbone unfrozen)
@@ -157,6 +160,7 @@ def train_student_with_distillation(
         val_dataset: Validation dataset (dual inputs)
         out_dir: Output directory
         num_classes: Number of classes
+        strategy: tf.distribute.Strategy for multi-GPU (optional)
 
     Returns:
         Trained student model
@@ -171,24 +175,32 @@ def train_student_with_distillation(
     student_config = config['student']
     distill_config = config['distillation']
 
-    # ========== Build Student Model ==========
+    # ========== Build Student Model (within strategy scope if provided) ==========
     logger.info("\nBuilding student model...")
-    student_model = build_student_model(
-        num_classes=num_classes,
-        input_size=student_config['input_size'],
-        dropout=student_config['dropout'],
-        weights='imagenet'
-    )
 
-    # ========== Create Distillation Model ==========
+    def create_models():
+        student_model = build_student_model(
+            num_classes=num_classes,
+            input_size=student_config['input_size'],
+            dropout=student_config['dropout'],
+            weights='imagenet',
+            variant=student_config.get('variant', 'lite4')
+        )
+        distill_model = DistillationModel(
+            teacher=teacher_model,
+            student=student_model,
+            alpha=distill_config['alpha'],
+            temperature=distill_config['temperature']
+        )
+        return student_model, distill_model
+
+    if strategy:
+        with strategy.scope():
+            student_model, distill_model = create_models()
+    else:
+        student_model, distill_model = create_models()
+
     logger.info("\nCreating distillation wrapper...")
-    distill_model = DistillationModel(
-        teacher=teacher_model,
-        student=student_model,
-        alpha=distill_config['alpha'],
-        temperature=distill_config['temperature']
-    )
-
     logger.info(f"Distillation config:")
     logger.info(f"  Alpha (hard loss weight): {distill_config['alpha']}")
     logger.info(f"  Temperature: {distill_config['temperature']}")
@@ -201,25 +213,40 @@ def train_student_with_distillation(
     # Freeze student backbone
     freeze_backbone(student_model)
 
-    # Compile
-    distill_model.compile(
-        optimizer=keras.optimizers.AdamW(
-            learning_rate=student_config['lr_head'],
-            weight_decay=student_config.get('weight_decay', 1e-4)
-        ),
-        loss=keras.losses.BinaryCrossentropy(from_logits=True),
-        metrics=[
-            keras.metrics.BinaryAccuracy(name='accuracy'),
-            keras.metrics.Precision(name='precision'),
-            keras.metrics.Recall(name='recall'),
-        ]
-    )
+    # Compile (within strategy scope if provided)
+    def compile_phase_a():
+        # Use experimental.AdamW for TF 2.10 compatibility
+        try:
+            optimizer = keras.optimizers.AdamW(
+                learning_rate=student_config['lr_head'],
+                weight_decay=student_config.get('weight_decay', 1e-4)
+            )
+        except AttributeError:
+            optimizer = keras.optimizers.experimental.AdamW(
+                learning_rate=student_config['lr_head'],
+                weight_decay=student_config.get('weight_decay', 1e-4)
+            )
+        distill_model.compile(
+            optimizer=optimizer,
+            loss=keras.losses.BinaryCrossentropy(from_logits=True),
+            metrics=[
+                keras.metrics.BinaryAccuracy(name='accuracy'),
+                keras.metrics.Precision(name='precision'),
+                keras.metrics.Recall(name='recall'),
+            ]
+        )
+
+    if strategy:
+        with strategy.scope():
+            compile_phase_a()
+    else:
+        compile_phase_a()
 
     # Callbacks
     callbacks_warmup = create_standard_callbacks(
         config=student_config,
         monitor='val_loss',
-        checkpoint_path=out_dir / 'student_warmup_best.h5',
+        checkpoint_path=out_dir / 'student_warmup_best.keras',
         log_dir=out_dir / 'logs_student_warmup'
     )
 
@@ -244,25 +271,40 @@ def train_student_with_distillation(
     # Unfreeze top layers of student
     unfreeze_top_layers(student_model, unfreeze_fraction=0.4)
 
-    # Recompile with lower learning rate
-    distill_model.compile(
-        optimizer=keras.optimizers.AdamW(
-            learning_rate=student_config['lr_finetune'],
-            weight_decay=student_config.get('weight_decay', 1e-4)
-        ),
-        loss=keras.losses.BinaryCrossentropy(from_logits=True),
-        metrics=[
-            keras.metrics.BinaryAccuracy(name='accuracy'),
-            keras.metrics.Precision(name='precision'),
-            keras.metrics.Recall(name='recall'),
-        ]
-    )
+    # Recompile with lower learning rate (within strategy scope if provided)
+    def compile_phase_b():
+        # Use experimental.AdamW for TF 2.10 compatibility
+        try:
+            optimizer = keras.optimizers.AdamW(
+                learning_rate=student_config['lr_finetune'],
+                weight_decay=student_config.get('weight_decay', 1e-4)
+            )
+        except AttributeError:
+            optimizer = keras.optimizers.experimental.AdamW(
+                learning_rate=student_config['lr_finetune'],
+                weight_decay=student_config.get('weight_decay', 1e-4)
+            )
+        distill_model.compile(
+            optimizer=optimizer,
+            loss=keras.losses.BinaryCrossentropy(from_logits=True),
+            metrics=[
+                keras.metrics.BinaryAccuracy(name='accuracy'),
+                keras.metrics.Precision(name='precision'),
+                keras.metrics.Recall(name='recall'),
+            ]
+        )
+
+    if strategy:
+        with strategy.scope():
+            compile_phase_b()
+    else:
+        compile_phase_b()
 
     # Callbacks for fine-tuning
     callbacks_finetune = create_standard_callbacks(
         config=student_config,
         monitor='val_loss',
-        checkpoint_path=out_dir / 'student_distill_best.h5',
+        checkpoint_path=out_dir / 'student_distill_best.keras',
         log_dir=out_dir / 'logs_student_finetune'
     )
 
@@ -283,9 +325,10 @@ def train_student_with_distillation(
     # Extract student from distillation wrapper
     final_student = distill_model.student
 
-    final_path = out_dir / 'student_final.h5'
-    final_student.save(final_path)
-    logger.info(f"\nSaved final student model to: {final_path}")
+    # Save weights only for TF 2.10 compatibility
+    final_path = out_dir / 'student_final.weights.h5'
+    final_student.save_weights(final_path)
+    logger.info(f"\nSaved final student weights to: {final_path}")
 
     # ========== Training Summary ==========
     logger.info("\n" + "=" * 80)
@@ -293,8 +336,8 @@ def train_student_with_distillation(
     logger.info("=" * 80)
     logger.info(f"Total epochs: {student_config['epochs_head'] + student_config['epochs_finetune']}")
     logger.info(f"Models saved:")
-    logger.info(f"  - {out_dir / 'student_warmup_best.h5'}")
-    logger.info(f"  - {out_dir / 'student_distill_best.h5'}")
+    logger.info(f"  - {out_dir / 'student_warmup_best.weights.h5'}")
+    logger.info(f"  - {out_dir / 'student_distill_best.weights.h5'}")
     logger.info(f"  - {final_path} (final)")
 
     return final_student

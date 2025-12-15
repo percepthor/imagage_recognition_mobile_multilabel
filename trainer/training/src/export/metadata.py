@@ -49,9 +49,15 @@ def generate_inference_config(
     # Based on export configuration
     output_is_logits = True  # We export logits by default
 
-    # Extract quantization details
+    # Extract quantization details (handle both 'scales'/'zero_points' and legacy formats)
     input_quant = tflite_metadata['input']['quantization']
     output_quant = tflite_metadata['output']['quantization']
+
+    # Get scale and zero_point (handle list format from tflite_export.py)
+    input_scale = input_quant.get('scales', input_quant.get('scale', []))[0] if input_quant.get('scales', input_quant.get('scale', [])) else 1.0
+    input_zp = input_quant.get('zero_points', input_quant.get('zero_point', []))[0] if input_quant.get('zero_points', input_quant.get('zero_point', [])) else 0
+    output_scale = output_quant.get('scales', output_quant.get('scale', []))[0] if output_quant.get('scales', output_quant.get('scale', [])) else 1.0
+    output_zp = output_quant.get('zero_points', output_quant.get('zero_point', []))[0] if output_quant.get('zero_points', output_quant.get('zero_point', [])) else 0
 
     # Build configuration
     inference_config = {
@@ -63,13 +69,13 @@ def generate_inference_config(
             "quantization": {
                 "input": {
                     "dtype": tflite_metadata['input']['dtype'],
-                    "scale": input_quant['scale'],
-                    "zero_point": input_quant['zero_point']
+                    "scale": float(input_scale),
+                    "zero_point": int(input_zp)
                 },
                 "output": {
                     "dtype": tflite_metadata['output']['dtype'],
-                    "scale": output_quant['scale'],
-                    "zero_point": output_quant['zero_point']
+                    "scale": float(output_scale),
+                    "zero_point": int(output_zp)
                 }
             }
         },

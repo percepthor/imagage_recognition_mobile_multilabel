@@ -1,0 +1,36 @@
+services:
+  trainer:
+    build: .
+    container_name: multilabel-trainer
+
+    # GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Volumes - override at runtime:
+    #   docker compose run -v /path/to/dataset:/data -v /path/to/output:/output trainer train ...
+    volumes:
+      - ${DATA_DIR:-./data}:/data:ro
+      - ${OUTPUT_DIR:-./output}:/output
+      - ${CONFIG_FILE:-./configs/default.yaml}:/app/configs/runtime.yaml:ro
+
+    environment:
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_CPP_MIN_LOG_LEVEL=1
+      - NVIDIA_VISIBLE_DEVICES=all
+
+    shm_size: '8gb'
+    stdin_open: true
+    tty: true
+
+    # Default training command
+    command: >
+      python -m src.cli train
+      --data_dir /data
+      --out_dir /output
+      --config /app/configs/runtime.yaml

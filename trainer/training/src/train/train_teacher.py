@@ -28,10 +28,13 @@ def train_teacher(
     train_dataset,
     val_dataset,
     out_dir: Path,
-    num_classes: int = 7
+    num_classes: int = 7,
+    strategy=None
 ):
     """
     Train teacher model (EfficientNet-B3) with 2-phase strategy.
+
+    Supports multi-GPU with tf.distribute.Strategy.
 
     Phase A: Warmup head only (backbone frozen)
     Phase B: Fine-tune with partial backbone unfrozen
@@ -42,6 +45,7 @@ def train_teacher(
         val_dataset: Validation tf.data.Dataset
         out_dir: Output directory for checkpoints
         num_classes: Number of classes
+        strategy: tf.distribute.Strategy for multi-GPU (optional)
 
     Returns:
         Trained teacher model
@@ -57,12 +61,20 @@ def train_teacher(
 
     # ========== Build Model ==========
     logger.info("\nBuilding teacher model...")
-    model = build_teacher_model(
-        num_classes=num_classes,
-        input_size=teacher_config['input_size'],
-        dropout=teacher_config['dropout'],
-        weights='imagenet'
-    )
+
+    def create_model():
+        return build_teacher_model(
+            num_classes=num_classes,
+            input_size=teacher_config['input_size'],
+            dropout=teacher_config['dropout'],
+            weights='imagenet'
+        )
+
+    if strategy:
+        with strategy.scope():
+            model = create_model()
+    else:
+        model = create_model()
 
     # ========== PHASE A: Warmup Head ==========
     logger.info("\n" + "=" * 80)
@@ -72,18 +84,25 @@ def train_teacher(
     # Freeze backbone
     freeze_backbone(model)
 
-    # Compile
-    compile_teacher(
-        model,
-        learning_rate=teacher_config['lr_head'],
-        weight_decay=teacher_config.get('weight_decay', 1e-4)
-    )
+    # Compile (within strategy scope if provided)
+    def compile_phase_a():
+        compile_teacher(
+            model,
+            learning_rate=teacher_config['lr_head'],
+            weight_decay=teacher_config.get('weight_decay', 1e-4)
+        )
+
+    if strategy:
+        with strategy.scope():
+            compile_phase_a()
+    else:
+        compile_phase_a()
 
     # Callbacks
     callbacks_warmup = create_standard_callbacks(
         config=teacher_config,
         monitor='val_loss',
-        checkpoint_path=out_dir / 'teacher_warmup_best.h5',
+        checkpoint_path=out_dir / 'teacher_warmup_best.keras',
         log_dir=out_dir / 'logs_warmup'
     )
 
@@ -108,18 +127,25 @@ def train_teacher(
     # Unfreeze top layers
     unfreeze_top_layers(model, unfreeze_fraction=0.3)
 
-    # Compile with lower learning rate
-    compile_teacher(
-        model,
-        learning_rate=teacher_config['lr_finetune'],
-        weight_decay=teacher_config.get('weight_decay', 1e-4)
-    )
+    # Compile with lower learning rate (within strategy scope if provided)
+    def compile_phase_b():
+        compile_teacher(
+            model,
+            learning_rate=teacher_config['lr_finetune'],
+            weight_decay=teacher_config.get('weight_decay', 1e-4)
+        )
+
+    if strategy:
+        with strategy.scope():
+            compile_phase_b()
+    else:
+        compile_phase_b()
 
     # Callbacks for fine-tuning
     callbacks_finetune = create_standard_callbacks(
         config=teacher_config,
         monitor='val_loss',
-        checkpoint_path=out_dir / 'teacher_best.h5',
+        checkpoint_path=out_dir / 'teacher_best.keras',
         validation_data=val_dataset,
         log_dir=out_dir / 'logs_finetune'
     )
@@ -138,9 +164,10 @@ def train_teacher(
     logger.info(f"  Best val_loss: {min(history_finetune.history['val_loss']):.4f}")
 
     # ========== Save Final Model ==========
-    final_path = out_dir / 'teacher_final.h5'
-    model.save(final_path)
-    logger.info(f"\nSaved final teacher model to: {final_path}")
+    # Save weights only for TF 2.10 compatibility (avoids JSON serialization issues)
+    final_path = out_dir / 'teacher_final.weights.h5'
+    model.save_weights(final_path)
+    logger.info(f"\nSaved final teacher weights to: {final_path}")
 
     # ========== Training Summary ==========
     logger.info("\n" + "=" * 80)
@@ -148,8 +175,8 @@ def train_teacher(
     logger.info("=" * 80)
     logger.info(f"Total epochs: {teacher_config['epochs_head'] + teacher_config['epochs_finetune']}")
     logger.info(f"Models saved:")
-    logger.info(f"  - {out_dir / 'teacher_warmup_best.h5'} (best from warmup)")
-    logger.info(f"  - {out_dir / 'teacher_best.h5'} (best from fine-tuning)")
+    logger.info(f"  - {out_dir / 'teacher_warmup_best.weights.h5'} (best from warmup)")
+    logger.info(f"  - {out_dir / 'teacher_best.weights.h5'} (best from fine-tuning)")
     logger.info(f"  - {final_path} (final)")
 
     return model

@@ -4,6 +4,11 @@
 seed: 1337
 num_classes: 7
 
+# Multi-GPU configuration
+multi_gpu:
+  enabled: false  # Set to true to use all available GPUs
+  strategy: mirrored  # MirroredStrategy for multi-GPU
+
 # Teacher model configuration (EfficientNet-B3)
 teacher:
   input_size: 300
@@ -18,10 +23,12 @@ teacher:
   reduce_lr_patience: 5
   reduce_lr_factor: 0.5
 
-# Student model configuration (EfficientNet-Lite B1)
+# Student model configuration (EfficientNet-Lite)
+# Available variants: lite0 (4MB), lite1 (5MB), lite2 (6MB), lite3 (7MB), lite4 (12MB)
 student:
-  input_size: 240
-  batch_size: 32
+  variant: lite1  # Use lite1 for ~5MB TFLite model
+  input_size: 240  # Default size for lite1
+  batch_size: 16
   epochs_head: 10
   epochs_finetune: 40
   lr_head: 1.0e-3

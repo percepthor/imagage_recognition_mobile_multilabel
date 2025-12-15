@@ -1,6 +1,8 @@
 """
 CLI for training multi-label classification with teacher-student distillation and QAT.
 
+Supports multi-GPU training with MirroredStrategy.
+
 Usage:
     python -m src.cli train --data_dir /data/dataset --out_dir /out/run_001 --config /app/configs/default.yaml
 """
@@ -19,6 +21,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def setup_multi_gpu(config: dict):
+    """
+    Configure multi-GPU training with MirroredStrategy.
+
+    Returns:
+        tf.distribute.Strategy or None
+    """
+    import tensorflow as tf
+
+    multi_gpu_config = config.get('multi_gpu', {})
+    if not multi_gpu_config.get('enabled', False):
+        logger.info("Multi-GPU disabled, using default strategy")
+        return None
+
+    gpus = tf.config.list_physical_devices('GPU')
+    logger.info(f"Found {len(gpus)} GPU(s): {gpus}")
+
+    if len(gpus) == 0:
+        logger.warning("No GPUs found, falling back to CPU")
+        return None
+
+    for gpu in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            logger.warning(f"Could not set memory growth for {gpu}: {e}")
+
+    strategy = tf.distribute.MirroredStrategy()
+    logger.info(f"Using MirroredStrategy with {strategy.num_replicas_in_sync} replicas")
+
+    return strategy
+
+
 def load_config(config_path: str) -> dict:
     """Load YAML configuration file."""
     with open(config_path, 'r') as f:
@@ -26,9 +61,9 @@ def load_config(config_path: str) -> dict:
     return config
 
 
-def train_pipeline(data_dir: str, out_dir: str, config: dict):
+def train_pipeline(data_dir: str, out_dir: str, config: dict, strategy=None):
     """
-    Full training pipeline:
+    Full training pipeline with multi-GPU support:
     1. Parse and validate dataset
     2. Train teacher model (EfficientNet-B3)
     3. Train student model with distillation (EfficientNet-Lite B1)
@@ -68,6 +103,11 @@ def train_pipeline(data_dir: str, out_dir: str, config: dict):
     logger.info("=" * 80)
     logger.info(f"Data dir: {data_dir}")
     logger.info(f"Output dir: {out_dir}")
+
+    if strategy:
+        logger.info(f"Strategy: MirroredStrategy with {strategy.num_replicas_in_sync} GPUs")
+    else:
+        logger.info("Strategy: Default (single device)")
 
     # Set random seed
     seed = config.get('seed', 1337)
@@ -135,7 +175,8 @@ def train_pipeline(data_dir: str, out_dir: str, config: dict):
         train_dataset=teacher_train_ds,
         val_dataset=teacher_val_ds,
         out_dir=out_dir,
-        num_classes=config['num_classes']
+        num_classes=config['num_classes'],
+        strategy=strategy
     )
 
     # Evaluate teacher on validation set
@@ -159,7 +200,8 @@ def train_pipeline(data_dir: str, out_dir: str, config: dict):
         train_dataset=distill_train_ds,
         val_dataset=distill_val_ds,
         out_dir=out_dir,
-        num_classes=config['num_classes']
+        num_classes=config['num_classes'],
+        strategy=strategy
     )
 
     # Evaluate student on validation set
@@ -177,16 +219,34 @@ def train_pipeline(data_dir: str, out_dir: str, config: dict):
     logger.info(f"STEP 5: Apply Quantization Aware Training")
     logger.info(f"{'=' * 80}")
 
-    qat_model = apply_qat_to_student(
-        config=config,
-        student_model=student_model,
-        train_dataset=student_train_ds,
-        val_dataset=student_val_ds,
-        out_dir=out_dir
-    )
+    # Try QAT - this is important for INT8 quantization quality
+    qat_model = None
+    qat_applied = False
+    try:
+        qat_model = apply_qat_to_student(
+            config=config,
+            student_model=student_model,
+            train_dataset=student_train_ds,
+            val_dataset=student_val_ds,
+            out_dir=out_dir
+        )
+        qat_applied = True
+        logger.info("QAT applied successfully!")
+    except (ValueError, RuntimeError) as e:
+        logger.error(f"QAT failed: {e}")
+        logger.warning("Will use post-training quantization (PTQ) instead")
+        logger.warning("NOTE: PTQ may result in larger model or lower accuracy")
+        qat_model = student_model
+        qat_applied = False
 
-    # Evaluate QAT model on validation set
-    logger.info("\nEvaluating QAT model on validation set...")
+    # Use student model if QAT failed
+    if qat_model is None:
+        qat_model = student_model
+        qat_applied = False
+
+    # Evaluate model on validation set (QAT or student)
+    model_name = "QAT" if qat_model != student_model else "STUDENT"
+    logger.info(f"\nEvaluating {model_name} model on validation set...")
     qat_val_metrics, y_true_val, y_pred_val = evaluate_model_on_dataset(
         qat_model,
         student_val_ds,
@@ -194,7 +254,7 @@ def train_pipeline(data_dir: str, out_dir: str, config: dict):
         threshold=0.5,
         return_predictions=True
     )
-    log_metrics(qat_val_metrics, prefix="QAT VAL")
+    log_metrics(qat_val_metrics, prefix=f"{model_name} VAL")
 
     # ========== STEP 6: Optimize Thresholds ==========
     logger.info(f"\n{'=' * 80}")
@@ -220,8 +280,8 @@ def train_pipeline(data_dir: str, out_dir: str, config: dict):
     # Create representative dataset generator
     representative_gen = create_representative_dataset_generator(
         train_data,
+        input_size=config['student']['input_size'],
         num_samples=config['tflite_export']['representative_dataset_size'],
-        preprocess_fn=None
     )
 
     # Export
@@ -236,9 +296,7 @@ def train_pipeline(data_dir: str, out_dir: str, config: dict):
 
     # Verify
     logger.info("\nVerifying TFLite model...")
-    # Get a test image
-    test_image_path = train_data[0][0] if len(train_data) > 0 else None
-    verify_tflite_model(str(tflite_path), test_image_path=test_image_path)
+    verify_tflite_model(str(tflite_path), num_classes=config['num_classes'])
 
     # ========== STEP 8: Generate inference config ==========
     logger.info(f"\n{'=' * 80}")
@@ -309,7 +367,8 @@ def main():
     if args.command == 'train':
         try:
             config = load_config(args.config)
-            train_pipeline(args.data_dir, args.out_dir, config)
+            strategy = setup_multi_gpu(config)
+            train_pipeline(args.data_dir, args.out_dir, config, strategy=strategy)
         except Exception as e:
             logger.error(f"Training pipeline failed: {e}", exc_info=True)
             sys.exit(1)
