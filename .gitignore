@@ -42,9 +42,11 @@ data/
 
 # Outputs
 outputs/
+outputsfinalbueno/
 logs/
 tensorboard/
 *.tflite
+run_*/
 
 # IDEs
 .vscode/
